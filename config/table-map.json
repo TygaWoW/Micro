@@ -1,0 +1,14 @@
+{
+  "tables": {
+    "delay": {
+      "appToken": "GRM6bKqaSax0MEs4fVmch5U6nze",
+      "tableId": "tblvnxbmWGysv27O",
+      "name": "延期数据汇总"
+    },
+    "completion_rate": {
+      "appToken": "GRM6bKqaSax0MEs4fVmch5U6nze",
+      "tableId": "tblglROn8pRaGAVI",
+      "name": "每周完成率数据"
+    }
+  }
+}

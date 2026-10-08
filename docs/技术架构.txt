@@ -1,0 +1,408 @@
+# 飞书 ↔ Claude 桥接器 · 技术架构文档
+
+> 写给接手维护的同事和排查问题的 AI Agent。读完本文档即可理解桥接器的完整架构、
+> 数据流和关键设计决策，无需再逐文件逆向工程。
+
+---
+
+## 1. 整体架构
+
+```
+┌─────────────┐     WebSocket      ┌──────────────────┐
+│  飞书服务器  │ ◄─────────────────► │  桥接器 (Node.js)  │
+│             │   im.message.       │                  │
+│  用户发消息  │   receive_v1 event  │  src/index.js    │
+│             │                    │        │         │
+└─────────────┘                    │  ┌─────┴──────┐  │
+                                   │  │ message    │  │
+                                   │  │ pipeline   │  │
+                                   │  └─────┬──────┘  │
+                                   │        │         │
+                                   │  spawn claude    │
+                                   │  CLI child proc  │
+                                   │        │         │
+                                   │  ┌─────┴──────┐  │
+                                   │  │ reply back  │  │
+                                   │  │ to Feishu   │  │
+                                   │  └────────────┘  │
+                                   └──────────────────┘
+
+进程守护: watchdog.ps1 (计划任务) → 监控 node 进程 → 崩溃自动重启
+```
+
+桥接器是一个**单进程 Node.js 应用**，通过飞书 SDK 建立长连接接收消息事件，
+解析后构造 prompt 调用 `claude.exe` 子进程处理，再将结果回复到飞书。
+
+---
+
+## 2. 目录结构与模块职责
+
+```
+src/
+├── index.js              ← 主编排：消息路由、prompt 构造、processMessage/Resource/MergeForward
+├── config.js             ← .env 加载 + 校验
+├── logger.js             ← 日志（pino，文件轮转）
+├── errors.js             ← 错误分类（BridgeError → 用户友好提示）
+├── queue.js              ← 合流窗口 + 并发控制（p-limit）
+├── commands.js           ← 本地命令（/new /stop /status）
+├── claude/
+│   ├── cli.js            ← 调用 claude.exe 子进程（spawn → collect stdout/exit）
+│   └── session.js        ← 会话 ID 管理（JSON 持久化，按 chatId 索引）
+├── feishu/
+│   ├── client.js         ← SDK 初始化 + WS + HTTP（获取消息/下载文件）
+│   ├── inbound.js        ← 消息归一化 + 认证 + 去重
+│   ├── rich-text.js      ← 统一富文本/卡片解析（post + interactive）
+│   ├── merge-forward.js  ← 合并转发渲染（树形结构 → 文本）
+│   └── outbound.js       ← 回复/发消息（含长文本分片）
+└── mcp/
+    ├── server.js         ← MCP server 入口（飞书工具暴露给 Claude）
+    ├── tools.js          ← MCP 工具实现（多维表格读写/文档操作/消息）
+    ├── feishu-table-map.js ← 表格字段映射
+    └── jira/
+        └── server.js     ← Jira MCP
+```
+
+### 模块依赖关系（关键）
+
+```
+index.js ──► inbound.js ──► rich-text.js   (消息解析链)
+         ──► merge-forward.js ──► rich-text.js
+         ──► claude/cli.js ──► claude/session.js
+         ──► feishu/client.js ──► [SDK WS + HTTP]
+         ──► feishu/outbound.js ──► [SDK HTTP]
+         ──► queue.js
+         ──► commands.js
+```
+
+`rich-text.js` 是纯函数模块，被 `inbound.js` 和 `merge-forward.js` 共用，
+无外部副作用。
+
+---
+
+## 3. 消息处理主流程
+
+```
+                    飞书 WebSocket 推送 event
+                            │
+                            ▼
+                  normalizeEvent(data)         ← inbound.js
+                  解析 content → rawText
+                  提取 resource (file/image key)
+                            │
+                            ▼
+                  isDuplicate(messageId)?      ← inbound.js
+                  内存 Map, 10min TTL
+                            │
+                            ▼
+                  authorize(inbound)?          ← inbound.js
+                  - 非默认 chat → 拒绝
+                  - 非 user 发送者 → 拒绝
+                  - 群聊未 @mention → 拒绝
+                            │
+                   ┌────────┴────────┐
+                   │                 │
+              resource?          merge_forward?
+                   │                 │
+                   ▼                 ▼
+         processResource()    processMergeForward()
+         下载文件 → 二进制检测  拉取子消息树 → renderMergeForward()
+         → 构造 prompt            → 构造 prompt
+                   │                 │
+                   └────────┬────────┘
+                            │
+                   text 为空?
+                      │ (非资源/非合并转发)
+                      ▼
+              processMessage()
+              → buildPrompt()
+                  解析引用上下文 (parentId)
+                  附加 chat 系统提示
+                            │
+                            ▼
+              enqueueCoalesced()           ← queue.js
+              合流窗口 1.5s，合并快速连发
+              并发限制: MAX_CONCURRENT_CLAUDE
+                            │
+                            ▼
+              runClaude({prompt})          ← cli.js
+              spawn claude.exe
+              collect stdout → extract final text
+                            │
+                            ▼
+              replyLongText(messageId, text)  ← outbound.js
+              飞书消息 4096 字符限制 → 自动分片
+```
+
+---
+
+## 4. 关键设计决策
+
+### 4.1 为什么调用 Claude CLI 而不是 API？
+
+用的是 `claude.exe` 子进程（`src/claude/cli.js`），不是 HTTP API。这样做的原因：
+
+1. **自动获得所有 MCP 工具**：Claude CLI 已注册飞书和 Jira MCP，启动子进程时自动注入
+2. **会话上下文**：通过 `--resume <sessionId>` 保持跨轮对话记忆
+3. **权限模式**：`--permission-mode bypassPermissions` 自动允许工具调用（无人值守）
+
+代价：
+- 依赖 claude.exe 在 PATH 或指定路径
+- 子进程管理和超时控制更复杂（SOFT_TIMEOUT_MS / HARD_TIMEOUT_MS）
+
+### 4.2 为什么只回最终结果不回流式过程？
+
+v0.1.3 之前桥接器会把 Claude 的工具调用、思考过程逐条流式发回飞书，
+造成严重噪音。v0.1.3 改为等 Claude 完全结束后，解析 stdout 中的最终
+`assistant` + `result` 文本，统一发一条完整回复。
+
+### 4.3 合流窗口（coalescing window）的作用？
+
+飞书长连接断线重连后会"重放"断线期间漏收的事件，同一 chat 会在瞬间灌入
+多条旧消息。`src/index.js` 的 `enqueueCoalesced()` 用 1.5 秒窗口合并：
+窗口内的多条消息只保留最后一条，前面的标为「已合并跳过」。
+
+正常对话（间隔 > 1.5 秒）不受影响。
+
+### 4.4 访问控制模型
+
+**只靠「锁定默认 chat」**，不设用户黑白名单。
+
+- `FEISHU_CHAT_ID` 配置哪个 chat，桥接器就只在这个 chat 里活跃
+- 其他 chat 的消息静默忽略（不泄露机器人存在）
+- 同一 chat 内任何人都能交互
+- 群聊需要 @机器人
+
+### 4.5 MCP 身份注入
+
+关键：飞书 MCP server 启动时没人会帮它读 `.env`（Claude Code 以随机 cwd 启动子进程）。
+因此 `lib/write-config.ps1` 在注册时把凭据写进 MCP 进程的 env 变量：
+
+```
+claude mcp add -s user feishu \
+  -e FEISHU_APP_ID=xxx \
+  -e FEISHU_APP_SECRET=xxx \
+  -e FEISHU_CHAT_ID=xxx \
+  -- node src/mcp/server.js
+```
+
+这样 MCP server 启动时从 `process.env` 拿到凭据，不依赖 cwd 下的 `.env` 文件。
+
+---
+
+## 5. 富文本解析（rich-text.js）
+
+### 支持的飞书消息格式
+
+| 消息类型 | JSON 结构 | 解析器 |
+|---------|----------|--------|
+| text | `{"text":"..."}` | 直接取 text 字段 |
+| post | `{"content_v2":[...]}` | `parsePostContent()` |
+| interactive (card) | `{"card":{...}}` | `parseCardContent()` |
+| file | `{"file_key":"..."}` | `parseResource()` → 下载后读取 |
+| image | `{"image_key":"..."}` | `parseResource()` → 友好提示 |
+| merge_forward | content 是占位符 | `renderMergeForward()` → 拉子消息树 |
+
+### Post 消息 9 种 tag 覆盖
+
+| Tag | 输出格式 | 行内/块级 |
+|-----|---------|---------|
+| `text` + `style:[bold]` | `**text**` | 行内 |
+| `text` + `style:[italic]` | `*text*` | 行内 |
+| `text` + `style:[underline]` | `<u>text</u>` | 行内 |
+| `text` + `style:[lineThrough]` | `~~text~~` | 行内 |
+| `a` + `href` | `[text](href)` | 行内 |
+| `at` + `user_name` | `@用户名` | 行内 |
+| `emotion` + `emoji_type` | Unicode 字符 | 行内 |
+| `code_block` | ` ```lang\ncode\n``` ` | 块级 |
+| `img` | `[图片:key]` | 块级 |
+| `media` | `[文件:name]` | 块级 |
+| `md` | 原文 | 块级 |
+| `hr` | `---` | 块级 |
+
+规则：
+- 同一段落内的行内 tag 直接拼接
+- 块级 tag 独立成段，`\n\n` 分隔
+- `content_v2` 优先于 `content`（飞书新版格式）
+
+### Emoji 映射
+
+约 80 个常见飞书 emoji_type → Unicode（`OK→👍`, `HEART→❤️`, `THUMBSUP→👍` 等）。
+未知 emoji_type 返回 `[emoji:xxx]` 占位符。
+
+---
+
+## 6. 文件处理（index.js processResource）
+
+### 文件检测链
+
+```
+downloadResource() → Buffer
+        │
+        ▼
+isBinaryBuffer(buf)?
+  ├── null byte 扫描（前 8 KiB）：有 null → 二进制
+  ├── 魔数检测（11 种）：
+  │   PNG / JPEG / GIF / BMP / WebP /
+  │   PDF / ZIP / GZIP / RAR / 7z / MP4
+  └── 都不是 → 文本
+        │
+   ┌────┴────┐
+   │         │
+二进制      文本
+拒绝        buf.toString('utf8')
+提示         → 空？拒绝
+            → 有内容？构造 prompt 给 Claude
+```
+
+### 图片消息特殊处理
+
+`image` 类型消息直接返回友好提示，不下载、不调用 Claude。
+（当前模型不支持图片识别。）
+
+---
+
+## 7. 进程生命周期
+
+```
+系统启动
+  │
+  ▼
+计划任务 FeishuClaudeBridge 触发
+  │
+  ▼
+watchdog.ps1 启动（常驻）
+  │
+  ├── 检查 state\bridge.stop（有则退出）
+  ├── 检查 node src/index.js 是否存活
+  │     ├── 存活 → sleep 5s → 回到检查
+  │     └── 挂了 → 重新启动 node src/index.js
+  │
+  ▼
+node src/index.js 启动
+  │
+  ├── acquireLock() — 写 state\bridge.lock（PID）
+  ├── startEventStream(onMessage) — 建立飞书 WS 长连接
+  └── 等待事件...
+```
+
+### 停止方式
+
+1. **双击 `关闭桥接器.bat`** → 放 `state\bridge.stop` + 杀 bridge 进程
+2. **放 `state\bridge.stop` 空文件** → watchdog 检测到后退出
+3. **跑 `uninstall-service.ps1`** → 删计划任务 + 停守护
+4. **关窗口不会停桥** — watchdog 是独立进程，关掉终端窗口不影响
+
+---
+
+## 8. 配置体系
+
+### 配置入口
+
+| 方式 | 文件 | 用途 |
+|------|------|------|
+| 弹窗（推荐） | `scripts/configure.ps1` | 填 App ID / Secret / Chat ID / Jira PAT |
+| 写入 | `lib/write-config.ps1` | 唯一写 `.env` 和注册 MCP 的地方 |
+
+### 关键环境变量（.env）
+
+| 变量 | 必填 | 说明 |
+|------|------|------|
+| FEISHU_APP_ID | ✅ | 飞书应用 App ID |
+| FEISHU_APP_SECRET | ✅ | 飞书应用凭据 |
+| FEISHU_CHAT_ID | ✅ | 默认 chat（oc_xxx 或 ou_xxx） |
+| JIRA_BASE_URL | ❌ | Jira 地址 |
+| JIRA_PAT | ❌ | Jira 个人访问令牌 |
+| CLAUDE_BIN | 自动探测 | claude.exe 路径 |
+| MAX_CONCURRENT_CLAUDE | — | 并发数（默认 2） |
+| SOFT_TIMEOUT_MS | — | soft timeout（默认 300000） |
+| HARD_TIMEOUT_MS | — | hard timeout（默认 900000） |
+
+---
+
+## 9. 常见问题排查
+
+### 桥接器不响应消息
+
+```
+检查清单:
+1. 飞书开放平台: Bot 能力已开启? 事件订阅切了长连接?
+2. 飞书开放平台: 权限至少开了 im:message:send_as_bot + receive_v1 + reply?
+3. 飞书开放平台: 发布了新版本?
+4. 本地: node src/index.js 是否在运行? (查看 logs\bridge-*.log)
+5. 本地: FEISHU_CHAT_ID 填对了吗? 消息来自配置的 chat 吗?
+6. 本地: 群聊是否 @了机器人?
+```
+
+### 启动报错 "Another instance is already running"
+
+```
+state\bridge.lock 残留。删除它即可。
+如果确实有另一个实例在跑，先关掉它。
+```
+
+### MCP 工具报 "permission denied" / "用户无权限"
+
+```
+检查:
+1. MCP env 里有没有正确注入凭据:
+   %USERPROFILE%\.claude.json 或 claude mcp list 查看
+2. 重新跑 一键配置.bat 覆盖 MCP 注册
+3. 飞书应用权限是否已开通
+```
+
+### 日志位置
+
+```
+logs\
+├── watchdog.log     ← watchdog 守护进程日志
+├── bridge-*.log     ← 桥接器主日志（按日期轮转）
+└── state\
+    ├── bridge.lock  ← 单实例锁（存 PID）
+    └── bridge.stop  ← 停止标记（存在即请求停止）
+```
+
+### 调日志级别
+
+修改 `.env` 中 `LOG_LEVEL=info` 为 `debug`，重启生效。
+
+---
+
+## 10. 关键修复历史（v1.1.3+）
+
+| 版本 | 修复 |
+|------|------|
+| v1.1.4 | watchdog 后台化修复关窗死桥、UTF-8 BOM 修复卸载脚本 |
+| v1.1.3 | 合流窗口 Promise 泄漏、Claude 非 0 退出误报 |
+| 当前 | 富文本全面升级（9 tag 全覆盖）、二进制文件魔数检测、MCP 重配置覆盖修复 |
+
+---
+
+## 11. 给 AI Agent 的快速定位指南
+
+当用户报告问题时，按以下顺序排查：
+
+### A. 桥接器不工作
+1. 查 `logs/bridge-*.log` → 搜 `ERROR` 或 `error`
+2. 检查 `state/bridge.lock` 里存的 PID 是否还活着
+3. 检查 `node src/index.js` 进程是否存在
+4. 跑 `node selfcheck/check.mjs` → 自检沙盒会逐一验证权限/连接
+
+### B. 消息已收到但 Claude 没响应
+1. bridge log 搜 `messageId` → 确认消息进了 pipeline
+2. 搜 `auth decision` → 确认认证通过
+3. 搜 `Claude` 或 `exit code` → 确认子进程是否异常退出
+4. 检查 Claude CLI 会话文件（`~/.claude/projects/...`）是否有残留锁
+
+### C. 飞书回复报错
+1. `bridge-*.log` 搜 `error` → 看错误栈
+2. 常见：`FEISHU_CHAT_ID` 填错、MCP 凭据过期、网络不通
+
+### D. 富文本解析不符合预期
+1. 定位 `parseMessageContent()` 在 `src/feishu/rich-text.js:244`
+2. 确认输入 content JSON 结构 → 用它做单元测试参数
+3. 9 种 tag 映射规则见本文档 §5
+
+### E. 文件上传被误判为二进制
+1. 检查 `isBinaryBuffer()` 逻辑在 `src/index.js:364`
+2. 查看文件是否以已知魔数开头（§6 列出 11 种）
+3. 前 8 KiB 是否有 null byte

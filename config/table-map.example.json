@@ -1,0 +1,27 @@
+{
+  "tables": {
+    "delay": {
+      "appToken": "PUT_YOUR_APP_TOKEN_HERE",
+      "tableId": "PUT_YOUR_TABLE_ID_HERE",
+      "name": "你的表格名",
+      "fields": {
+        "字段中文名": { "id": "PUT_FIELD_ID_HERE", "type": "text" }
+      }
+    },
+    "completion_rate": {
+      "appToken": "PUT_YOUR_APP_TOKEN_HERE",
+      "tableId": "PUT_YOUR_TABLE_ID_HERE",
+      "name": "你的表格名",
+      "wikiToken": "PUT_WIKI_TOKEN_HERE_OR_OMIT",
+      "fields": {
+        "字段中文名": { "id": "PUT_FIELD_ID_HERE", "type": "number" }
+      }
+    }
+  },
+  "progressOptions": {
+    "选项名": "PUT_OPTION_ID_HERE"
+  },
+  "reasonTypeOptions": {
+    "选项名": "PUT_OPTION_ID_HERE"
+  }
+}
